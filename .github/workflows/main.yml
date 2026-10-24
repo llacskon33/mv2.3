@@ -12,7 +12,6 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      # 1. Clean temporary files and measure disk space
       - name: Clean Windows and Check Disk
         shell: pwsh
         run: |
@@ -21,19 +20,17 @@ jobs:
           function Show-DiskSpace {
             Get-CimInstance Win32_LogicalDisk `
               -Filter "DeviceID='C:'" |
-              Select-Object DeviceID,
-                @{N='TotalGB';E={[math]::Round($_.Size/1GB,2)}},
-                @{N='FreeGB';E={[math]::Round($_.FreeSpace/1GB,2)}} |
-              Format-Table -AutoSize
+              ForEach-Object {
+                Write-Host ("Total: {0:N2} GB | Free: {1:N2} GB" -f `
+                  ($_.Size / 1GB), ($_.FreeSpace / 1GB))
+              }
           }
 
           Write-Host "=== DISK BEFORE CLEANUP ==="
           Show-DiskSpace
 
-          $paths = @(
-            $env:TEMP,
-            "$env:WINDIR\Temp"
-          )
+          # Clean temporary files
+          $paths = @($env:TEMP, "$env:WINDIR\Temp")
 
           foreach ($path in $paths) {
             if (Test-Path $path) {
@@ -44,54 +41,56 @@ jobs:
             }
           }
 
+          # Clean Windows component store
           DISM.exe /Online /Cleanup-Image /StartComponentCleanup
 
           Write-Host "=== DISK AFTER CLEANUP ==="
           Show-DiskSpace
 
-      # 2. Generate a random password and configure the RDP user
-      - name: Create RDP User and Generate Password
-        id: credentials
+      - name: Generate Password and Create RDP User
         shell: pwsh
         run: |
           $upper = 'ABCDEFGHJKLMNPQRSTUVWXYZ'.ToCharArray()
           $lower = 'abcdefghijkmnopqrstuvwxyz'.ToCharArray()
           $digits = '23456789'.ToCharArray()
           $special = '!@#$%&*_-+'.ToCharArray()
-
           $all = $upper + $lower + $digits + $special
+
           $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
 
           function Get-SecureChar($set) {
             $bytes = New-Object byte[] 4
             $rng.GetBytes($bytes)
-            $number = [BitConverter]::ToUInt32($bytes, 0)
-            return $set[[int]($number % $set.Length)]
+            $n = [BitConverter]::ToUInt32($bytes, 0)
+            return $set[[int]($n % $set.Length)]
           }
 
-          $passwordChars = @()
-          $passwordChars += Get-SecureChar $upper
-          $passwordChars += Get-SecureChar $lower
-          $passwordChars += Get-SecureChar $digits
-          $passwordChars += Get-SecureChar $special
+          $chars = @(
+            (Get-SecureChar $upper)
+            (Get-SecureChar $lower)
+            (Get-SecureChar $digits)
+            (Get-SecureChar $special)
+          )
 
           for ($i = 4; $i -lt 24; $i++) {
-            $passwordChars += Get-SecureChar $all
+            $chars += Get-SecureChar $all
           }
 
-          $password = -join ($passwordChars | Sort-Object { Get-Random })
-          $rng.Dispose()
+          # Shuffle the generated password
+          for ($i = $chars.Count - 1; $i -gt 0; $i--) {
+            $j = Get-Random -Minimum 0 -Maximum ($i + 1)
+            $temp = $chars[$i]
+            $chars[$i] = $chars[$j]
+            $chars[$j] = $temp
+          }
 
-          # Mask the password in GitHub Actions logs
-          Write-Output "::add-mask::$password"
+          $password = -join $chars
+          $rng.Dispose()
 
           $securePassword = ConvertTo-SecureString `
             $password -AsPlainText -Force
 
-          $existingUser = Get-LocalUser -Name RDP `
-            -ErrorAction SilentlyContinue
-
-          if ($existingUser) {
+          if (Get-LocalUser -Name RDP -ErrorAction SilentlyContinue) {
             Set-LocalUser -Name RDP -Password $securePassword
           } else {
             New-LocalUser -Name RDP `
@@ -104,13 +103,10 @@ jobs:
             -Member RDP `
             -ErrorAction SilentlyContinue
 
-          # Pass credentials to later steps within this job
-          "password=$password" >> $env:GITHUB_OUTPUT
+          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
 
-          Write-Host "RDP account configured."
-          Write-Host "Password generated and masked."
+          Write-Host "RDP user created and password generated."
 
-      # 3. Configure Remote Desktop
       - name: Configure RDP
         shell: pwsh
         run: |
@@ -129,7 +125,6 @@ jobs:
 
           Write-Host "RDP configured with NLA enabled."
 
-      # 4. Install Tailscale
       - name: Install Tailscale
         shell: pwsh
         run: |
@@ -142,20 +137,20 @@ jobs:
             -ArgumentList "/i `"$installer`" /quiet /norestart" `
             -Wait -PassThru
 
-          Remove-Item $installer -Force -ErrorAction SilentlyContinue
+          Remove-Item $installer -Force `
+            -ErrorAction SilentlyContinue
 
           if ($process.ExitCode -notin @(0, 3010)) {
             throw "Tailscale installation failed."
           }
 
-      # 5. Connect to the private Tailscale network
       - name: Connect Tailscale
         shell: pwsh
         env:
           TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
-            throw "Missing TAILSCALE_AUTH_KEY repository secret."
+            throw "Missing TAILSCALE_AUTH_KEY GitHub secret."
           }
 
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
@@ -181,7 +176,6 @@ jobs:
           "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
           Write-Host "Tailscale connected."
 
-      # 6. Check RDP connectivity
       - name: Verify RDP
         shell: pwsh
         run: |
@@ -207,32 +201,16 @@ jobs:
 
           Write-Host "RDP connectivity verified."
 
-      # 7. Display connection details in the run summary
-      - name: Publish Connection Details
-        shell: pwsh
-        env:
-          RDP_PASSWORD: ${{ steps.credentials.outputs.password }}
-        run: |
-          @"
-          # RDP Connection Details
-
-          - **Address:** $env:TAILSCALE_IP
-          - **Username:** RDP
-          - **Password:** $env:RDP_PASSWORD
-
-          Keep these credentials private. The password changes on every run.
-          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY `
-            -Encoding utf8 -Append
-
-          Write-Host "Connection details added to the run summary."
-
-      # 8. Keep the session alive for the job's allowed duration
-      - name: Keep Session Alive
+      - name: Maintain Connection
         shell: pwsh
         run: |
-          Write-Host "RDP session is active."
-          Write-Host "The workflow will end when its time limit is reached."
+          Write-Host "=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "=================="
 
           while ($true) {
+            Write-Host "RDP active: $(Get-Date)"
             Start-Sleep -Seconds 300
           } 
